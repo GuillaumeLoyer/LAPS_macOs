@@ -1,4 +1,5 @@
 # LAPS_macOs
+
 Description
 This repository contains a script that automates the process of creating a local administrator account on macOS devices. The script generates a random password for the account and securely stores it in Azure Key Vault. The script is designed to be deployed via Microsoft Intune for enterprise environments.
 
