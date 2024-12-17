@@ -1,59 +1,112 @@
+
 # macOS Local Admin Account Creation and Azure Key Vault Integration
 
 ## Description
 
-This repository contains a script that automates the process of creating a local administrator account on macOS devices. The script generates a random password for the account and securely stores it in **Azure Key Vault**. The script is designed to be deployed via **Microsoft Intune** for enterprise environments.
+This repository contains two scripts:
+
+1. **Bash Script**: Runs on macOS devices (deployed via **Microsoft Intune**) to automate the creation of a local administrator account. The generated password is securely stored in **Azure Key Vault**.
+2. **PowerShell Script**: Runs on Azure via an **Automation Runbook** to manage and purge deleted secrets from the **Azure Key Vault**.
 
 ## Features
 
-- **Random Password Generation**: Creates a strong, randomized password for the new local administrator account.
-- **macOS Local Admin Account**: Creates a local administrator account with the generated password.
-- **Azure Key Vault Integration**: The password is securely stored in **Azure Key Vault** for safe retrieval.
-- **Secret Management**: The script checks if the secret already exists in Azure, deletes it if necessary, and recreates it with the new password.
-- **Logging**: Logs all actions performed during the script execution in a log file on the macOS device.
+### Bash Script (macOS)
+- **Random Password Generation**: Automatically generates a secure password for the new local administrator account.
+- **Local Admin Account Creation**: Creates a local administrator account on the macOS device.
+- **Azure Key Vault Integration**: Securely stores the generated password in **Azure Key Vault**.
+- **Secret Management**: Deletes existing secrets in the Key Vault (if necessary) before creating new ones.
+- **Logging**: Logs script actions for troubleshooting and auditing.
+
+### PowerShell Script (Azure Runbook)
+- **Azure Key Vault Purging**: Purges deleted secrets to maintain a clean and secure **Azure Key Vault** instance.
+- **Automation Ready**: Designed to be run periodically as an **Azure Automation Runbook**.
 
 ## Prerequisites
 
-Before running the script, ensure the following:
+### For the Bash Script (macOS):
+Ensure the following tools and configurations are in place:
+- An **Azure Key Vault** instance with permissions to manage secrets.
+- **Tenant ID**, **Client ID**, and **Client Secret** for Azure authentication.
+- **Microsoft Intune** setup for deploying scripts to target devices.
 
-- You have an **Azure Key Vault** instance set up with the correct permissions to create and manage secrets.
-- You have the **Tenant ID**, **Client ID**, and **Client Secret** for Azure authentication.
-- The following tools must be available on the macOS machine:
-  - `openssl`
-  - `curl`
-  - `sysadminctl`
-- The script is designed to be deployed via **Microsoft Intune**.
+### For the PowerShell Script (Azure):
+- An **Azure Key Vault** instance configured with appropriate permissions.
+- An **Azure Automation Account** to host and schedule the script as a Runbook.
 
-## Deployment via Microsoft Intune
+## Deployment Instructions
 
-To deploy the script to macOS devices using **Microsoft Intune**:
+### Bash Script Deployment via Microsoft Intune
 
-1. Create a **Shell Script** deployment in **Microsoft Intune**.
-2. Upload the script to Intune.
-3. Configure any necessary parameters (if needed).
-4. Assign the deployment to the target macOS devices or device groups.
+1. Log in to **Microsoft Endpoint Manager Admin Center**.
+2. Navigate to **Devices > macOS > Shell Scripts**.
+3. Create a new Shell Script deployment.
+4. Upload the provided Bash script.
+5. Configure any necessary parameters (e.g., script execution frequency, logging settings).
+6. Assign the deployment to targeted macOS devices.
 
-Once deployed, the script will automatically create a local administrator account on the macOS device and store its password in **Azure Key Vault**.
+Once deployed, the script will:
+- Create a local administrator account.
+- Generate and securely store the account password in **Azure Key Vault**.
+
+### PowerShell Script Deployment in Azure
+
+1. Log in to the **Azure Portal**.
+2. Navigate to your **Automation Account**.
+3. Import the provided PowerShell script as a Runbook.
+4. Schedule the Runbook to run periodically (e.g., daily or weekly).
+
+The script will automatically purge deleted secrets in **Azure Key Vault** to maintain security.
 
 ## Configuration
 
-Before running or deploying the script, modify the following variables in the script:
+Before deployment, update the following variables in the scripts:
 
-- `adminaccountname`: The name of the administrator account to create (e.g., `adminuser`).
-- `key_vault_name`: The name of your **Azure Key Vault** instance.
-- `tenant_id`: Your **Azure Tenant ID**.
-- `client_id`: Your **Azure Client ID**.
-- `azure_api_secret`: Your **Azure Client Secret**.
+### Bash Script (macOS):
+- `adminaccountname`: Name of the admin account to be created (e.g., `adminuser`).
+- `key_vault_name`: Name of the Azure Key Vault instance.
+- `tenant_id`: Azure Tenant ID.
+- `client_id`: Azure Client ID.
+- `azure_api_secret`: Azure Client Secret.
+
+### PowerShell Script (Azure):
+- `keyVaultName`: Name of the Azure Key Vault instance.
 
 ## Logs
 
-The script generates a log file located at `/var/log/intune_scripts/laps.log` on the macOS device. This file contains detailed information about the actions performed during the script execution, including:
+### Bash Script Logs (macOS):
+Logs are generated on the macOS device at:
 
-- The creation of the administrator account.
-- Interactions with **Azure Key Vault** (checking, deleting, and creating the secret).
+```
+/var/log/intune_scripts/laps.log
+```
 
-## Azure Key Vault Purging Script (PowerShell)
+These logs include:
+- Account creation details.
+- Azure Key Vault operations (e.g., secret creation and management).
 
-To maintain the security and efficiency of the **Azure Key Vault**, a **PowerShell script** is run periodically as an **Azure Automation Runbook** to purge deleted secrets from the Key Vault. This script retrieves and purges all deleted secrets from the configured Key Vault. 
+### PowerShell Script Logs (Azure):
+Azure Automation Runbook execution logs can be viewed in the **Runbook Output** section of the Automation Account.
 
-You can find the PowerShell script for purging deleted secrets in the repository.
+## Security Best Practices
+
+- Rotate passwords periodically to enhance security.
+- Use least-privilege access for Azure accounts interacting with Key Vault.
+- Securely store **Client ID** and **Client Secret** using Azure Key Vault or secure environment variables.
+- Regularly audit and monitor Azure Key Vault usage.
+
+## Support
+
+For any issues, contributions, or suggestions, open an issue or pull request in this repository.
+
+---
+
+### Files Included
+
+- `macos_admin_creation.sh`: Bash script for macOS local admin creation and Key Vault integration.
+- `purge_keyvault_secrets.ps1`: PowerShell script to purge deleted secrets in Azure Key Vault.
+
+---
+
+### License
+
+This project is licensed under the MIT License. See `LICENSE` for details.
