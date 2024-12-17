@@ -1,4 +1,3 @@
-# LAPS_macOs
 # macOS Local Admin Account Creation and Azure Key Vault Integration
 
 ## Description
@@ -52,3 +51,9 @@ The script generates a log file located at `/var/log/intune_scripts/laps.log` on
 
 - The creation of the administrator account.
 - Interactions with **Azure Key Vault** (checking, deleting, and creating the secret).
+
+## Azure Key Vault Purging Script (PowerShell)
+
+To maintain the security and efficiency of the **Azure Key Vault**, a **PowerShell script** is run periodically as an **Azure Automation Runbook** to purge deleted secrets from the Key Vault. This script retrieves and purges all deleted secrets from the configured Key Vault. 
+
+You can find the PowerShell script for purging deleted secrets in the repository.
