@@ -1,3 +1,9 @@
+#!/usr/bin/env bash
+set -eu -o pipefail
+
+# Optional: trap function to log and exit gracefully on an error
+trap 'log_message "An unexpected error occurred. Exiting..."' ERR
+
 #######################################
 # Configuration Variables
 #######################################
