@@ -1,30 +1,41 @@
-###
-# PLEASE REPLACE 'PLACEHOLDER' VALUES
-###
-
 import sys
 import os
-import threading
-import webbrowser
 import logging
-from datetime import datetime
 import base64
 import requests
+from datetime import datetime
 from urllib.parse import quote
-from PyQt5.QtCore import Qt, pyqtSlot, pyqtSignal
+
+from PyQt5.QtCore import Qt, pyqtSlot, pyqtSignal, QRunnable, QThreadPool, QObject
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton,
     QMessageBox, QProgressBar, QComboBox
 )
 from PyQt5.QtGui import QPalette, QColor, QPixmap, QIcon
+
 from azure.identity import InteractiveBrowserCredential, ClientSecretCredential
 from azure.keyvault.secrets import SecretClient
 from msal import ConfidentialClientApplication
+from azure.data.tables import TableServiceClient
+from azure.core.exceptions import ResourceNotFoundError
 
-# Set up logging
+# --------------------------
+# Configuration / Constants
+# --------------------------
+AUTH_WINDOW_SIZE = (350, 200)
+COMPUTER_WINDOW_SIZE = (450, 400)
+KV_CREDENTIALS_URL = "https://<vault_name>.vault.azure.net/"
+STORAGE_TABLE_ENDPOINT = "https://<table_name>.table.core.windows.net/"
+TENANT_ID = "<tenant_id>"
+
+# --------------------------
+# Logging Setup
+# --------------------------
 logging.basicConfig(level=logging.DEBUG)
 
-
+# --------------------------
+# Helper Functions
+# --------------------------
 def resource_path(relative_path):
     """Get absolute path to resource, works for dev and PyInstaller."""
     try:
@@ -33,13 +44,52 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
+def center_window(window):
+    """Center a given window on the primary screen."""
+    screen = QApplication.primaryScreen()
+    geom = screen.availableGeometry()
+    x = geom.x() + (geom.width() - window.width()) // 2
+    y = geom.y() + (geom.height() - window.height()) // 2
+    window.move(x, y)
 
+# --------------------------
+# Worker Classes for Background Tasks
+# --------------------------
+class WorkerSignals(QObject):
+    finished = pyqtSignal(object)
+    error = pyqtSignal(tuple)
+
+class Worker(QRunnable):
+    """
+    Worker thread for running a function in the background.
+    """
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+        
+    def run(self):
+        try:
+            result = self.fn(*self.args, **self.kwargs)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.signals.error.emit((e, tb))
+        else:
+            self.signals.finished.emit(result)
+
+# --------------------------
+# Main Application Windows
+# --------------------------
 class AuthWindow(QWidget):
     success_signal = pyqtSignal()
     auth_failed_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
+        self.threadpool = QThreadPool()
         self.success_signal.connect(self.success)
         self.auth_failed_signal.connect(self.auth_failed)
         self.initUI()
@@ -64,60 +114,52 @@ class AuthWindow(QWidget):
         layout.addWidget(self.loading_bar)
 
         self.setLayout(layout)
-        self.setWindowTitle("Admin Password")
-        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        self.setWindowTitle("<title>")
         self.setWindowIcon(QIcon(resource_path("logo.ico")))
-        self.resize(350, 200)
-        self.center_on_primary_screen()
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        self.setFixedSize(*AUTH_WINDOW_SIZE)
+        center_window(self)
         self.show()
-
-    def center_on_primary_screen(self):
-        screen = QApplication.primaryScreen()
-        size = screen.availableGeometry()
-        x = size.x() + (size.width() - self.width()) // 2
-        y = size.y() + (size.height() - self.height()) // 2
-        self.move(x, y)
 
     def authenticate(self):
         self.loading_bar.setVisible(True)
         self.auth_button.setDisabled(True)
-        threading.Thread(target=self.try_authenticate).start()
+        worker = Worker(self.try_authenticate)
+        worker.signals.finished.connect(lambda _: self.success_signal.emit())
+        worker.signals.error.connect(self.on_authenticate_error)
+        self.threadpool.start(worker)
 
     def try_authenticate(self):
-        try:
-            logging.debug("Starting Azure authentication...")
-            self.personal_credential = InteractiveBrowserCredential(additionally_allowed_tenants=["*"])
-            personal_client = SecretClient(
-                vault_url="https://PLACEHOLDER.vault.azure.net",
-                credential=self.personal_credential
-            )
-            client_id = personal_client.get_secret("PLACEHOLDER").value
-            client_secret = personal_client.get_secret("PLACEHOLDER").value
-            tenant_id = "PLACEHOLDER"
+        logging.debug("Starting Azure authentication...")
+        personal_credential = InteractiveBrowserCredential(additionally_allowed_tenants=["*"])
+        personal_client = SecretClient(
+            vault_url=KV_CREDENTIALS_URL,
+            credential=personal_credential
+        )
+        client_id = personal_client.get_secret("<client_id>").value
+        client_secret = personal_client.get_secret("<client_secret>").value
 
-            self.app_credential = ClientSecretCredential(
-                tenant_id=tenant_id,
-                client_id=client_id,
-                client_secret=client_secret
-            )
-            self.app_credential.get_token("https://management.azure.com/.default")
+        self.app_credential = ClientSecretCredential(
+            tenant_id=TENANT_ID,
+            client_id=client_id,
+            client_secret=client_secret
+        )
+        self.app_credential.get_token("https://management.azure.com/.default")
 
-            self.graph_api_client = ConfidentialClientApplication(
-                client_id=client_id,
-                authority=f"https://login.microsoftonline.com/{tenant_id}",
-                client_credential=client_secret
-            )
+        self.graph_api_client = ConfidentialClientApplication(
+            client_id=client_id,
+            authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+            client_credential=client_secret
+        )
+        return True
 
-            self.success_signal.emit()
-            logging.debug("Azure authentication successful.")
-        except Exception as e:
-            error_message = (
-                "You do not have the required permissions to access the key vault."
-                if "403" in str(e)
-                else "An error occurred during authentication. Please try again."
-            )
-            self.auth_failed_signal.emit(error_message)
-            logging.error(f"Authentication failed: {e}")
+    def on_authenticate_error(self, error_tuple):
+        exception, tb = error_tuple
+        error_message = ("You do not have the required permissions to access the key vault."
+                         if "403" in str(exception)
+                         else "An error occurred during authentication. Please try again.")
+        self.auth_failed_signal.emit(error_message)
+        logging.error(f"Authentication failed: {exception}\n{tb}")
 
     @pyqtSlot()
     def success(self):
@@ -133,7 +175,6 @@ class AuthWindow(QWidget):
         self.auth_button.setDisabled(False)
         QMessageBox.critical(self, "Authentication Failed", message, QMessageBox.Ok)
 
-
 class ComputerWindow(QWidget):
     devices_found_signal = pyqtSignal(list)
     status_signal = pyqtSignal(str, QColor)
@@ -141,6 +182,7 @@ class ComputerWindow(QWidget):
 
     def __init__(self, credential, graph_api_client):
         super().__init__()
+        self.threadpool = QThreadPool()
         self.credential = credential
         self.graph_api_client = graph_api_client
         self.secret_value = None
@@ -148,7 +190,6 @@ class ComputerWindow(QWidget):
         self.devices_found_signal.connect(self.populate_devices)
         self.status_signal.connect(self.display_status)
         self.secret_retrieved_signal.connect(self.on_secret_retrieved)
-
         self.initUI()
 
     def initUI(self):
@@ -161,7 +202,7 @@ class ComputerWindow(QWidget):
         self.logo.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.logo)
 
-        self.label = QLabel("Enter the user name:", self)
+        self.label = QLabel("Enter user email, device name, or serial number:", self)
         layout.addWidget(self.label)
 
         self.user_name_input = QLineEdit(self)
@@ -207,16 +248,9 @@ class ComputerWindow(QWidget):
         layout.addWidget(self.result)
 
         self.setLayout(layout)
-        self.setWindowTitle("Admin Password")
-        self.resize(400, 400)
-        self.center_on_primary_screen()
-
-    def center_on_primary_screen(self):
-        screen = QApplication.primaryScreen()
-        size = screen.availableGeometry()
-        x = size.x() + (size.width() - self.width()) // 2
-        y = size.y() + (size.height() - self.height()) // 2
-        self.move(x, y)
+        self.setWindowTitle("<title>")
+        self.setFixedSize(*COMPUTER_WINDOW_SIZE)
+        center_window(self)
 
     def on_input_changed(self):
         self.search_button.setDisabled(not self.user_name_input.text().strip())
@@ -234,50 +268,58 @@ class ComputerWindow(QWidget):
 
     def search_devices(self):
         self.result.setText("")
-        user_name = self.user_name_input.text().strip().replace(" ", ".").replace("'", "''")
+        search_term = self.user_name_input.text().strip().replace("'", "''")
         self.search_button.setDisabled(True)
         self.loading_bar.setVisible(True)
-        threading.Thread(target=self.retrieve_devices, args=(user_name,)).start()
+        worker = Worker(self.retrieve_devices, search_term)
+        worker.signals.finished.connect(self.on_devices_found)
+        worker.signals.error.connect(lambda err: self.on_search_error(err))
+        self.threadpool.start(worker)
+
+    def on_devices_found(self, result):
+        self.loading_bar.setVisible(False)
+        self.search_button.setDisabled(False)
+        if not result:
+            self.status_signal.emit("No devices found.", QColor("red"))
+        else:
+            self.devices_found_signal.emit(result)
+
+    def on_search_error(self, error_tuple):
+        exception, tb = error_tuple
+        self.loading_bar.setVisible(False)
+        self.search_button.setDisabled(False)
+        self.status_signal.emit(f"Error: {exception}", QColor("red"))
+        logging.error(f"Error searching for devices: {exception}\n{tb}")
 
     def get_graph_api_token(self):
-        token = self.graph_api_client.acquire_token_silent(
-            ["https://graph.microsoft.com/.default"], account=None
-        )
+        token = self.graph_api_client.acquire_token_silent(["https://graph.microsoft.com/.default"], account=None)
         if not token:
-            token = self.graph_api_client.acquire_token_for_client(
-                scopes=["https://graph.microsoft.com/.default"]
-            )
+            token = self.graph_api_client.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
         return token
 
-    def retrieve_devices(self, user_name):
-        try:
-            logging.debug(f"Searching for devices for user: {user_name}")
-            token = self.get_graph_api_token()
-
-            headers = {"Authorization": f"Bearer {token['access_token']}"}
-            filter_query = (
-                f"contains(userPrincipalName,'{user_name}') and "
-                "(operatingSystem eq 'Windows' or operatingSystem eq 'macOS')"
-            )
-            url = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices"
-            params = {"$filter": filter_query}
-            response = requests.get(url, headers=headers, params=params, timeout=10)
+    def retrieve_devices(self, search_term):
+        logging.debug(f"Searching for devices with search term: {search_term}")
+        token = self.get_graph_api_token()
+        headers = {"Authorization": f"Bearer {token['access_token']}"}
+        base_url = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices"
+        filters = [
+            f"contains(userPrincipalName, '{search_term}')",
+            f"contains(deviceName, '{search_term}')",
+            f"contains(serialNumber, '{search_term}')"
+        ]
+        all_devices = []
+        for f in filters:
+            query = f"({f} and (operatingSystem eq 'Windows' or operatingSystem eq 'macOS'))"
+            params = {"$filter": query}
+            logging.debug(f"Querying with filter: {query}")
+            response = requests.get(base_url, headers=headers, params=params, timeout=10)
             logging.debug(f"Response from managedDevices: {response.status_code}")
             logging.debug(f"Response Body: {response.text}")
             response.raise_for_status()
-
             devices = response.json().get("value", [])
-            if devices:
-                self.devices_found_signal.emit(devices)
-            else:
-                self.status_signal.emit("No devices found.", QColor("red"))
-                logging.debug("No devices found.")
-        except Exception as e:
-            self.status_signal.emit(f"Error: {e}", QColor("red"))
-            logging.error(f"Error searching for devices: {e}")
-        finally:
-            self.loading_bar.setVisible(False)
-            self.search_button.setDisabled(False)
+            all_devices.extend(devices)
+        unique_devices = {device['id']: device for device in all_devices}.values()
+        return list(unique_devices)
 
     @pyqtSlot(list)
     def populate_devices(self, devices):
@@ -291,9 +333,9 @@ class ComputerWindow(QWidget):
     @pyqtSlot(str, QColor)
     def display_status(self, message, color):
         self.result.setText(message)
-        palette = self.result.palette()
-        palette.setColor(QPalette.WindowText, color)
-        self.result.setPalette(palette)
+        pal = self.result.palette()
+        pal.setColor(QPalette.WindowText, color)
+        self.result.setPalette(pal)
 
     def get_secret(self):
         selected_device = self.device_dropdown.currentData()
@@ -308,98 +350,81 @@ class ComputerWindow(QWidget):
         self.share_button.setDisabled(True)
 
         if selected_device["operatingSystem"] == "macOS":
-            threading.Thread(
-                target=self.retrieve_secret_from_vault, args=(selected_device["deviceName"],)
-            ).start()
+            worker = Worker(self.retrieve_secret_from_vault, selected_device["deviceName"])
+            worker.signals.finished.connect(lambda res: self._secret_success(res, "macOS secret retrieved."))
+            worker.signals.error.connect(self._secret_error)
+            self.threadpool.start(worker)
         elif selected_device["operatingSystem"] == "Windows":
-            threading.Thread(
-                target=self.retrieve_secret_from_intune, args=(selected_device["id"],)
-            ).start()
+            worker = Worker(self.retrieve_secret_from_intune, selected_device["id"])
+            worker.signals.finished.connect(lambda res: self._secret_success(res, "Windows secret retrieved."))
+            worker.signals.error.connect(self._secret_error)
+            self.threadpool.start(worker)
+
+    def _secret_success(self, secret, success_message):
+        self.secret_value = secret
+        self.status_signal.emit(success_message, QColor("green"))
+        self.secret_retrieved_signal.emit()
+        self.loading_bar.setVisible(False)
+
+    def _secret_error(self, error_tuple):
+        exception, tb = error_tuple
+        msg = str(exception)
+        if isinstance(exception, ResourceNotFoundError):
+            msg = "Computer not found in database."
+        self.status_signal.emit(msg, QColor("red"))
+        logging.error(f"Secret retrieval error: {exception}\n{tb}")
+        self.loading_bar.setVisible(False)
 
     def retrieve_secret_from_vault(self, device_name):
-        try:
-            vault_url = "https://PLACEHOLDER.vault.azure.net"
-            client = SecretClient(vault_url=vault_url, credential=self.credential)
-            secret = client.get_secret(device_name)
-            self.secret_value = secret.value
-            self.status_signal.emit("macOS secret retrieved.", QColor("green"))
-            logging.debug(f"macOS secret retrieved: {self.secret_value}")
-            self.secret_retrieved_signal.emit()
-        except Exception as e:
-            error_msg = f"Error retrieving macOS secret: {e}"
-            self.status_signal.emit(error_msg, QColor("red"))
-            logging.error(error_msg)
-        finally:
-            self.loading_bar.setVisible(False)
-            self.button.setDisabled(False)
+        logging.debug(f"Retrieving macOS secret for device: {device_name} from Storage Table")
+        table_service = TableServiceClient(
+            endpoint=STORAGE_TABLE_ENDPOINT,
+            credential=self.credential
+        )
+        table_client = table_service.get_table_client(table_name="<table>")
+        entity = table_client.get_entity(partition_key="macOS", row_key=device_name)
+        logging.debug(f"Retrieved entity: {entity}")
+        password = entity.get("Password")
+        if not password:
+            raise ValueError("Password not found in storage table.")
+        return str(password)
 
     def retrieve_secret_from_intune(self, intune_device_id):
-        try:
-            logging.debug("Starting retrieval for Windows device...")
-            token = self.get_graph_api_token()
-
-            headers = {
-                "Authorization": f"Bearer {token['access_token']}",
-                "ocp-client-name": "AdminClient",
-                "ocp-client-version": "1.0"
-            }
-
-            # Fetch device details to get the Azure AD Device ID
-            url_device_details = f"https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/{intune_device_id}"
-            device_response = requests.get(url_device_details, headers=headers, timeout=10)
-            logging.debug(f"Response from managedDevices: {device_response.status_code}")
-            logging.debug(f"Response Body: {device_response.text}")
-            device_response.raise_for_status()
-
-            device_data = device_response.json()
-            azure_ad_device_id = device_data.get("azureADDeviceId")
-            logging.debug(f"Azure AD Device ID: {azure_ad_device_id}")
-
-            if not azure_ad_device_id:
-                self.status_signal.emit("Azure AD Device ID not found for this device.", QColor("red"))
-                logging.error("Azure AD Device ID not found.")
-                return
-
-            # Fetch Local Admin Password using the Azure AD Device ID
-            url_local_credentials = f"https://graph.microsoft.com/v1.0/directory/deviceLocalCredentials/{azure_ad_device_id}?$select=credentials"
-            credentials_response = requests.get(url_local_credentials, headers=headers, timeout=10)
-            logging.debug(f"Response from deviceLocalCredentials: {credentials_response.status_code}")
-            logging.debug(f"Response Body: {credentials_response.text}")
-            credentials_response.raise_for_status()
-
-            credentials_data = credentials_response.json()
-            credentials = credentials_data.get("credentials", [])
-            if credentials:
-                # Sort credentials by backupDateTime and get the most recent one
-                latest_credential = max(
-                    credentials,
-                    key=lambda x: datetime.fromisoformat(x["backupDateTime"].replace('Z', '+00:00'))
-                )
-                password_base64 = latest_credential.get("passwordBase64")
-                if password_base64:
-                    password = base64.b64decode(password_base64).decode('utf-8')
-                    self.secret_value = password
-                    self.status_signal.emit("Windows secret retrieved.", QColor("green"))
-                    logging.debug(f"Windows secret retrieved: {password}")
-                    self.secret_retrieved_signal.emit()
-                else:
-                    self.status_signal.emit("Password not found in the latest credential.", QColor("red"))
-                    logging.error("Password missing in the latest credential.")
-            else:
-                self.status_signal.emit("No credentials found for this device.", QColor("red"))
-                logging.error("No credentials found in the response.")
-        except requests.exceptions.HTTPError as e:
-            error_details = e.response.text if hasattr(e, 'response') and e.response else str(e)
-            error_msg = f"HTTP Error: {e}, Response Body: {error_details}"
-            self.status_signal.emit(f"Error retrieving Windows secret: {e}", QColor("red"))
-            logging.error(error_msg)
-        except Exception as e:
-            error_msg = f"General Exception: {e}"
-            self.status_signal.emit(f"Error retrieving Windows secret: {e}", QColor("red"))
-            logging.error(error_msg)
-        finally:
-            self.loading_bar.setVisible(False)
-            self.button.setDisabled(False)
+        logging.debug("Starting retrieval for Windows device...")
+        token = self.get_graph_api_token()
+        headers = {
+            "Authorization": f"Bearer {token['access_token']}",
+            "ocp-client-name": "adminClient",
+            "ocp-client-version": "1.0"
+        }
+        url_device_details = f"https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/{intune_device_id}"
+        device_response = requests.get(url_device_details, headers=headers, timeout=10)
+        logging.debug(f"Response from managedDevices: {device_response.status_code}")
+        logging.debug(f"Response Body: {device_response.text}")
+        device_response.raise_for_status()
+        device_data = device_response.json()
+        azure_ad_device_id = device_data.get("azureADDeviceId")
+        logging.debug(f"Azure AD Device ID: {azure_ad_device_id}")
+        if not azure_ad_device_id:
+            raise ValueError("Azure AD Device ID not found for this device.")
+        url_local_credentials = f"https://graph.microsoft.com/v1.0/directory/deviceLocalCredentials/{azure_ad_device_id}?$select=credentials"
+        credentials_response = requests.get(url_local_credentials, headers=headers, timeout=10)
+        logging.debug(f"Response from deviceLocalCredentials: {credentials_response.status_code}")
+        logging.debug(f"Response Body: {credentials_response.text}")
+        credentials_response.raise_for_status()
+        credentials_data = credentials_response.json()
+        credentials = credentials_data.get("credentials", [])
+        if not credentials:
+            raise ValueError("No credentials found for this device.")
+        latest_credential = max(
+            credentials,
+            key=lambda x: datetime.fromisoformat(x["backupDateTime"].replace('Z', '+00:00'))
+        )
+        password_base64 = latest_credential.get("passwordBase64")
+        if not password_base64:
+            raise ValueError("Password not found in the latest credential.")
+        password = base64.b64decode(password_base64).decode('utf-8')
+        return password
 
     @pyqtSlot()
     def on_secret_retrieved(self):
@@ -414,10 +439,12 @@ class ComputerWindow(QWidget):
             logging.debug("Secret copied to clipboard.")
 
     def share_secret(self):
-        webbrowser.open("https://exemple.com/")
+        webbrowser.open("https://microsoft.com/")
         logging.debug("Sharing secret securely.")
 
-
+# --------------------------
+# Main Function
+# --------------------------
 def main():
     app = QApplication(sys.argv)
     auth_window = AuthWindow()

@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -eu -o pipefail
 
-# Optional: trap function to log and exit gracefully on an error
-trap 'log_message "An unexpected error occurred. Exiting..."' ERR
-
 #######################################
 # Configuration Variables
 #######################################
@@ -12,10 +9,14 @@ log_folder="/var/log/intune_scripts"
 log_file="$log_folder/laps.log"
 max_log_size=51200  # 50 KB
 
-key_vault_name="<vault_name>"
+# Azure AD App (Client Credentials)
 tenant_id="<your_tenant_id>"
 client_id="<your_client_id>"
-azure_api_secret="<your_client_secret>"
+client_secret="<your_client_secret>"
+
+# Azure Storage
+storage_account_name="<storageaccount>"
+table_name="<table>"
 
 #######################################
 # Helper Functions
@@ -23,8 +24,7 @@ azure_api_secret="<your_client_secret>"
 
 log_message() {
     local msg="$1"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') | $msg" >> "$log_file"
-    echo "$msg"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | $msg" | tee -a "$log_file" >&2
 }
 
 rotate_logs_if_needed() {
@@ -53,75 +53,152 @@ generate_random_password() {
     echo "${randomstring}${upper}${digit}${lower}${specchar}"
 }
 
-get_access_token() {
+get_storage_token() {
+    log_message "Requesting Azure Storage access token using client credentials..."
     local response
-    response=$(curl -s -X POST "https://login.microsoftonline.com/$tenant_id/oauth2/v2.0/token" \
+    response=$(curl -s -X POST \
+        "https://login.microsoftonline.com/$tenant_id/oauth2/v2.0/token" \
         -H "Content-Type: application/x-www-form-urlencoded" \
-        -d "grant_type=client_credentials&client_id=$client_id&client_secret=$azure_api_secret&scope=https://vault.azure.net/.default")
+        -d "client_id=$client_id" \
+        -d "client_secret=$client_secret" \
+        -d "grant_type=client_credentials" \
+        -d "scope=https://storage.azure.com/.default")
 
-    echo "$response" | grep -o '"access_token":"[^"]*' | grep -o '[^"]*$'
+    local access_token
+    access_token=$(echo "$response" | jq -r '.access_token')
+
+    if [ -z "$access_token" ]; then
+        log_message "Failed to retrieve access token from AAD. Full response: $response"
+        exit 1
+    fi
+    log_message "Access token retrieved successfully."
+    echo "$access_token"
 }
 
-check_key_vault_connectivity() {
-    # Check if we can list secrets. If this fails, the vault is not reachable or unauthorized.
-    local status
-    status=$(curl -s -o /dev/null -w "%{http_code}" "https://$key_vault_name.vault.azure.net/secrets?api-version=7.4" \
-        -H "Authorization: Bearer $access_token")
-    [ "$status" -eq 200 ]
-}
-
-secret_exists() {
-    local secret_name="$1"
-    local status
-    status=$(curl -s -o /dev/null -w "%{http_code}" -X GET \
-        "https://$key_vault_name.vault.azure.net/secrets/$secret_name?api-version=7.4" \
-        -H "Authorization: Bearer $access_token")
-    [[ "$status" == "200" ]]
-}
-
-delete_secret() {
-    local secret_name="$1"
-    curl -s -o /dev/null -w "%{http_code}" -X DELETE \
-        "https://$key_vault_name.vault.azure.net/secrets/$secret_name?api-version=7.4" \
-        -H "Authorization: Bearer $access_token"
-}
-
-purge_deleted_secret() {
-    local secret_name="$1"
-    curl -s -o /dev/null -w "%{http_code}" -X DELETE \
-        "https://$key_vault_name.vault.azure.net/deletedsecrets/$secret_name?api-version=7.4" \
-        -H "Authorization: Bearer $access_token"
-}
-
-update_or_create_secret() {
-    local secret_name="$1"
-    local secret_value="$2"
-    curl -s -o /dev/null -w "%{http_code}" -X PUT \
-        "https://$key_vault_name.vault.azure.net/secrets/$secret_name?api-version=7.4" \
-        -H "Authorization: Bearer $access_token" \
-        -H "Content-Type: application/json" \
-        -d "{\"value\":\"$secret_value\"}"
-}
-
-create_admin_user() {
+create_or_update_admin_user() {
     local username="$1"
     local password="$2"
 
     if id "$username" &>/dev/null; then
-        log_message "User $username already exists. Deleting..."
-        sysadminctl -deleteUser "$username" >> "$log_file" 2>&1
+        log_message "User $username already exists. Rotating password..."
+        dscl . -passwd "/Users/$username" "$password" >> "$log_file" 2>&1
+        log_message "Password for user $username updated successfully."
     else
-        log_message "User $username does not exist."
+        log_message "User $username does not exist. Creating..."
+        sysadminctl \
+            -addUser "$username" \
+            -fullName "$username" \
+            -password "$password" \
+            -admin >> "$log_file" 2>&1
+        log_message "User $username created successfully."
+
+        log_message "Hiding user $username..."
+        defaults write /Library/Preferences/com.apple.loginwindow HiddenUsersList -array-add "$username" >> "$log_file" 2>&1
+        log_message "User $username hidden."
     fi
+}
 
-    log_message "Creating user $username..."
-    sysadminctl -adminUser "$username" -adminPassword "$password" \
-        -addUser "$username" -fullName "$username" -password "$password" -admin >> "$log_file" 2>&1
-    log_message "User $username created."
+############################################
+# Table Storage REST Calls
+############################################
 
-    log_message "Hiding user $username..."
-    defaults write /Library/Preferences/com.apple.loginwindow HiddenUsersList -array-add "$username" >> "$log_file" 2>&1
-    log_message "User $username hidden."
+store_password_in_table() {
+    local machine_name="$1"
+    local password="$2"
+    local access_token="$3"
+
+    local partition="macOS"
+    local rowkey="$machine_name"
+
+    log_message "Storing password in Azure Table: $table_name (Storage Account: $storage_account_name)"
+
+    # Sanitize PartitionKey and RowKey by removing newline and control characters
+    partition=$(echo -n "$partition" | tr -d '\n\r')
+    rowkey=$(echo -n "$rowkey" | tr -d '\n\r')
+
+    # URL-encode PartitionKey and RowKey
+    local encoded_partition
+    local encoded_rowkey
+    encoded_partition=$(echo -n "$partition" | jq -sRr @uri)
+    encoded_rowkey=$(echo -n "$rowkey" | jq -sRr @uri)
+
+    local entity_url="https://${storage_account_name}.table.core.windows.net/$table_name(PartitionKey='$encoded_partition',RowKey='$encoded_rowkey')"
+
+    local body
+    body=$(cat <<EOF
+{
+  "PartitionKey": "$partition",
+  "RowKey": "$rowkey",
+  "Password": "$password"
+}
+EOF
+)
+
+    local response
+    response=$(curl -s -w "\nHTTP_CODE=%{http_code}" -X MERGE \
+        -H "Authorization: Bearer $access_token" \
+        -H "Accept: application/json;odata=nometadata" \
+        -H "Content-Type: application/json" \
+        -H "If-Match: *" \
+        -H "x-ms-version: 2025-01-05" \
+        -H "x-ms-date: $(date -u +"%a, %d %b %Y %H:%M:%S GMT")" \
+        -d "$body" \
+        "$entity_url")
+
+    local http_code
+    http_code=$(echo "$response" | sed -n 's/^HTTP_CODE=//p')
+    local response_body
+    response_body=$(echo "$response" | sed '/^HTTP_CODE=/d')
+
+    if [[ "$http_code" == "204" ]]; then
+        log_message "Entity merged successfully (HTTP 204)."
+    elif [[ "$http_code" == "404" ]]; then
+        log_message "Entity not found. Performing an INSERT..."
+        insert_entity "$access_token" "$partition" "$rowkey" "$password"
+    else
+        log_message "ERROR: MERGE failed with code $http_code. Response: $response_body"
+        exit 1
+    fi
+}
+
+insert_entity() {
+    local access_token="$1"
+    local partition="$2"
+    local rowkey="$3"
+    local password="$4"
+
+    local table_url="https://${storage_account_name}.table.core.windows.net/$table_name"
+
+    local body
+    body=$(cat <<EOF
+{
+  "PartitionKey": "$partition",
+  "RowKey": "$rowkey",
+  "Password": "$password"
+}
+EOF
+)
+
+    local response
+    response=$(curl -s -w "\nHTTP_CODE=%{http_code}" -X POST \
+        -H "Authorization: Bearer $access_token" \
+        -H "Accept: application/json;odata=nometadata" \
+        -H "Content-Type: application/json" \
+        -H "x-ms-version: 2025-01-05" \
+        -d "$body" \
+        "$table_url")
+
+    local http_code
+    http_code=$(echo "$response" | sed -n 's/^HTTP_CODE=//p')
+    local response_body
+    response_body=$(echo "$response" | sed '/^HTTP_CODE=/d')
+
+    if [[ "$http_code" == "201" ]]; then
+        log_message "Entity inserted successfully (HTTP 201)."
+    else
+        log_message "ERROR: INSERT failed with code $http_code. Response: $response_body"
+        exit 1
+    fi
 }
 
 #######################################
@@ -130,66 +207,11 @@ create_admin_user() {
 
 mkdir -p "$log_folder" && chmod 755 "$log_folder"
 rotate_logs_if_needed
-log_message "===== Starting script LAPS ====="
-
+log_message "===== Starting script LAPS (Azure Table version) ====="
+storage_token=$(get_storage_token)
 machine_name=$(get_machine_name)
 log_message "Machine name: $machine_name"
-
-log_message "Requesting Azure access token..."
-access_token=$(get_access_token)
-if [ -z "$access_token" ]; then
-    log_message "Failed to retrieve access token."
-    exit 1
-fi
-log_message "Access token retrieved successfully."
-
-log_message "Checking Key Vault connectivity..."
-if ! check_key_vault_connectivity; then
-    log_message "Key Vault connectivity check failed. Exiting without modifying local admin account."
-    exit 1
-fi
-log_message "Key Vault connectivity OK."
-
 password=$(generate_random_password)
-create_admin_user "$adminaccountname" "$password"
-
-log_message "Checking if secret '$machine_name' exists in Azure Key Vault..."
-if secret_exists "$machine_name"; then
-    log_message "Secret '$machine_name' exists. Deleting..."
-    delete_result=$(delete_secret "$machine_name")
-    if [[ "$delete_result" == "200" || "$delete_result" == "204" ]]; then
-        log_message "Secret '$machine_name' deleted successfully. Waiting for 30 seconds..."
-        sleep 30
-        log_message "Purging secret '$machine_name'..."
-        purge_result=$(purge_deleted_secret "$machine_name")
-        if [ "$purge_result" == "204" ]; then
-            log_message "Secret '$machine_name' purged successfully. Waiting for 30 seconds..."
-            sleep 30
-            log_message "Recreating the secret '$machine_name'..."
-            create_result=$(update_or_create_secret "$machine_name" "$password")
-            if [[ "$create_result" == "200" || "$create_result" == "201" ]]; then
-                log_message "Secret '$machine_name' created successfully."
-            else
-                log_message "Failed to create secret. Response code: $create_result."
-                exit 1
-            fi
-        else
-            log_message "Failed to purge secret. Response code: $purge_result."
-            exit 1
-        fi
-    else
-        log_message "Failed to delete secret. Response code: $delete_result."
-        exit 1
-    fi
-else
-    log_message "Secret '$machine_name' does not exist. Creating..."
-    create_result=$(update_or_create_secret "$machine_name" "$password")
-    if [[ "$create_result" == "200" || "$create_result" == "201" ]]; then
-        log_message "Secret '$machine_name' created successfully."
-    else
-        log_message "Failed to create secret. Response code: $create_result."
-        exit 1
-    fi
-fi
-
-log_message "Script completed successfully."
+create_or_update_admin_user "$adminaccountname" "$password"
+store_password_in_table "$machine_name" "$password" "$storage_token"
+log_message "===== Script completed successfully. ====="
